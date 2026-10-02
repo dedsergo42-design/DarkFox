@@ -1,0 +1,3 @@
+#include "resource.h"
+
+// INTRO_WAV (resources\intro.wav, 2.5 МБ) удалён вместе с загрузочным экраном.

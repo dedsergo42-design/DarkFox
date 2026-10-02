@@ -1,0 +1,53 @@
+# ─── Артефакты сборки ────────────────────────────────────────────────────────
+bin/
+!bin/.gitkeep
+*.obj
+*.o
+*.res
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.log
+*.dmp
+*.idb
+*.lastbuildstate
+
+# Промежуточные каталоги MSVC
+[Ii]ntermediates/
+[Dd]ebug/
+[Rr]elease/
+x64/
+DarkFoxInt/
+
+# vcpkg (восстанавливается из vcpkg.json)
+vcpkg_installed/
+vcpkg_installed.cmake
+
+# Одноразовые скрипты-зонды
+.test/
+
+# Кэши Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ─── Рабочие данные агента и бэкапы ──────────────────────────────────────────
+.workbuddy-ai/
+*.bak
+*.bak_*
+*.previous.*
+backups/
+
+# ─── Редакторы и ОС ──────────────────────────────────────────────────────────
+.vs/
+.vscode/
+desktop.ini
+Thumbs.db
+*.swp
+
+# ─── Секреты и локальные настройки ───────────────────────────────────────────
+.env
+.env_build.bat
+*.token
+gh_token.txt
