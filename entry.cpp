@@ -20,11 +20,76 @@
 #include <core/defaults.hpp>
 
 #include <utilities/diag.hpp>
+#include <utilities/security/signature.hpp>
 
 namespace {
 
 	std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_previous_exception_filter {};
 	PVOID g_vectored_exception_handler {};
+
+	// Маркер подлинности. Лежит в .rdata (const) и НЕ удаляется линкером,
+	// потому что его адрес отдаётся наружу через экспорт ниже -- это делает
+	// объект достижимым, и /OPT:REF не имеет права его выбросить.
+	//
+	// Значение целиком вычисляется на этапе компиляции, включая checksum --
+	// так в бинаре не остаётся места, где поле «дозаполняется» в рантайме,
+	// и лоадер видит готовую структуру сразу из файла.
+	//
+	// Checksum считается по ЗНАЧЕНИЯМ полей, а не по сырым байтам структуры:
+	// reinterpret_cast в constant evaluation запрещён, и полагаться на
+	// выравнивание/порядок байт тут нечего. Лоадер считает ровно так же --
+	// алгоритм должен совпадать до последнего XOR, иначе сверка всегда мимо.
+	constexpr std::uint32_t signature_word( const char* text, std::size_t count )
+	{
+		std::uint32_t value{};
+		for (auto index = 0u; index < count && text[ index ]; ++index) {
+			value |= static_cast< std::uint32_t >(
+				static_cast< unsigned char >( text[ index ] ) ) << ( ( index % 4 ) * 8 );
+		}
+		return value;
+	}
+
+	constexpr darkfox::signature::info make_signature_marker()
+	{
+		darkfox::signature::info value{};
+		value.magic = darkfox::signature::k_magic;
+		value.format = darkfox::signature::k_format;
+#if defined(DEV)
+		value.build_id = 0x000000DEu;
+#else
+		value.build_id = 0x00000051u;
+#endif
+
+		for (auto index = 0u; index < sizeof( value.build ) - 1 && darkfox::signature::k_build[ index ]; ++index) {
+			value.build[ index ] = darkfox::signature::k_build[ index ];
+		}
+
+		constexpr auto* k_project = "DarkFox";
+		for (auto index = 0u; index < sizeof( value.project ) - 1 && k_project[ index ]; ++index) {
+			value.project[ index ] = k_project[ index ];
+		}
+
+		value.checksum = value.magic ^ value.format ^ value.build_id
+			^ signature_word( value.build, sizeof( value.build ) )
+			^ signature_word( value.project, sizeof( value.project ) );
+
+		return value;
+	}
+
+	// constinit const -- объект без динамической инициализации, живёт в .rdata.
+	// Отдельная секция тут не нужна: обычного .rdata достаточно, а
+	// разбираться с #pragma section ради одного объекта -- лишний риск.
+	// Живучесть при /OPT:REF обеспечивает экспорт ниже (он ссылается на объект).
+	constinit const darkfox::signature::info g_signature_marker
+		= make_signature_marker();
+
+	// Экспорт-маркер: лоадер ищет это имя в таблице экспорта PE. Возвращать
+	// что-либо осмысленное не нужно -- важно само наличие символа, а данные
+	// лоадер читает из .rdata. noinline -- чтобы функцию не свернули в ничто.
+	extern "C" __declspec( dllexport, noinline ) const darkfox::signature::info* darkfox_signature()
+	{
+		return &g_signature_marker;
+	}
 
 	LONG WINAPI diag_unhandled_exception_filter (EXCEPTION_POINTERS* info);
 

@@ -26,6 +26,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <functional>
@@ -37,6 +38,8 @@
 #include <external/xdraw/xdraw.hpp>
 #include <external/xdraw/xui/xui.hpp>
 #include <core/resources/fonts/inter.hpp>
+
+#include "verification.hpp"
 
 #pragma comment( lib, "d3d11.lib" )
 #pragma comment( lib, "dxgi.lib" )
@@ -125,6 +128,13 @@ namespace {
 	bool         g_dll_from_scan{};
 	bool         g_scanning{};
 	std::atomic<int> g_scan_visited{};
+	// Результат проверки выбранного файла. Заполняется тем же потоком, что
+	// ищет DLL; читается UI-потоком. Храним целиком, а не флагом: в карточке
+	// нужно показать, ЧЕМ именно файл не подошёл (не x64 / нет маркера /
+	// хеш не сошёлся), иначе пользователь видит только «не найдена».
+	verification::result g_dll_check{};
+	std::mutex           g_check_mtx{};
+
 	bool         g_shortcut_ok{};
 	std::wstring g_shortcut_note{};
 	bool         g_steam_running{};
@@ -224,6 +234,28 @@ namespace {
 		std::string result( static_cast< std::size_t >( count ), '\0' );
 		WideCharToMultiByte( CP_UTF8, 0, wide.c_str( ), static_cast< int >( wide.size( ) ),
 			result.data( ), count, nullptr, nullptr );
+		return result;
+	}
+
+	// Обратная конвертация: тексты проверки подлинности живут в verification.hpp
+	// как ASCII (их пишет и читает только лоадер), но в UI-строку их надо
+	// вклеить рядом с широкими литералами.
+	std::wstring to_wide( const std::string& narrow )
+	{
+		if ( narrow.empty( ) ) {
+			return {};
+		}
+
+		const auto count = MultiByteToWideChar( CP_UTF8, 0, narrow.c_str( ),
+			static_cast< int >( narrow.size( ) ), nullptr, 0 );
+
+		if ( count <= 0 ) {
+			return {};
+		}
+
+		std::wstring result( static_cast< std::size_t >( count ), L'\0' );
+		MultiByteToWideChar( CP_UTF8, 0, narrow.c_str( ), static_cast< int >( narrow.size( ) ),
+			result.data( ), count );
 		return result;
 	}
 
@@ -489,7 +521,41 @@ namespace {
 		return roots;
 	}
 
-	std::wstring resolve_dll_path( )
+	// Ожидаемая сборка для этого лоадера. Маркер в DLL хранит "dev" или "ship",
+	// и лоадер обязан инжектить только своё: дев-лоадер с релизной DLL --
+	// это не косметика, а разные наборы хуков и разная диагностика.
+	constexpr const char* k_expected_build = k_dev_build ? "dev" : "ship";
+
+	// Проверяет кандидата и, если он годен, публикует результат для UI.
+	// Возвращает true только для файла, который действительно можно инжектить.
+	bool check_candidate( const std::wstring& path, bool publish )
+	{
+		const auto result = verification::verify( path, k_expected_build );
+
+		if ( publish ) {
+			std::scoped_lock lock( g_check_mtx );
+			g_dll_check = result;
+		}
+
+		if ( result.state != verification::status::ok ) {
+			return false;
+		}
+
+		// Мягкий режим: хеш не сошёлся -- всё равно инжектим (файл-то наш,
+		// маркер на месте), но пользователь увидит предупреждение в карточке.
+		return true;
+	}
+
+	// То же самое, но результат отдаётся наружу и ничего не публикуется.
+	// Нужно обходу дисков: он проверяет десятки кандидатов и не должен
+	// затирать состояние UI промежуточными диагнозами.
+	bool check_candidate_silent( const std::wstring& path, verification::result& out )
+	{
+		out = verification::verify( path, k_expected_build );
+		return out.state == verification::status::ok;
+	}
+
+	std::wstring resolve_dll_path( bool publish = true )
 	{
 		const auto directory = exe_directory( );
 		if ( directory.empty( ) ) {
@@ -497,40 +563,74 @@ namespace {
 		}
 
 		// 1. Кэш -- самый быстрый путь и он же подтверждает прошлый поиск.
-		// Проверяем не только существование файла, но и то, что это НАША
-		// сборка: кэш мог остаться от другого варианта лоадера или от
-		// скопированного руками файла. Без этой проверки дев-лоадер
-		// инжектил обычную версию.
+		// Проверяем не только существование файла, но и подлинность: кэш мог
+		// остаться от другого варианта лоадера, файл могли подменить или он
+		// мог испортиться. Только имя в этом месте ничего не гарантирует.
 		const auto cached = read_cache( );
-		if ( !cached.empty( ) && file_exists( cached )
-			&& ( is_exact_match( cached ) || is_same_family( cached ) ) ) {
+		if ( !cached.empty( ) && file_exists( cached ) && check_candidate( cached, publish ) ) {
 			return cached;
 		}
 
-		// 2. Ближние кандидаты. Их проверяем до окна: лоадер лежит в bin\
-		//    рядом с DLL в 99% случаев, и полный обход тут не нужен.
-		const std::wstring local[ ] = {
-			directory + L"\\" + k_dll_name,
-			directory + L"\\..\\bin\\" + k_dll_name,
-			directory + L"\\..\\" + k_dll_name,
-		};
+		// 2. Ближние кандидаты. Лоадер лежит в bin\ рядом с DLL в 99% случаев,
+		//    и полный обход тут не нужен.
+		//
+		//    Порядок важен: сначала точное имя, потом родственные (бэкапы).
+		//    Первый же ГОДНЫЙ файл побеждает -- «самый новый» тут не критерий,
+		//    потому что свежим может оказаться и битый.
+		//
+		//    Плюс рабочий каталог и %TEMP%: DLL часто кладут туда при
+		//    распаковке архива, а лоадер запускают из другого места.
+		std::vector< std::wstring > local;
+		local.push_back( directory + L"\\" + k_dll_name );
+		local.push_back( directory + L"\\..\\bin\\" + k_dll_name );
+		local.push_back( directory + L"\\..\\" + k_dll_name );
+
+		{
+			wchar_t cwd[ MAX_PATH ]{};
+			if ( GetCurrentDirectoryW( MAX_PATH, cwd ) && _wcsicmp( cwd, directory.c_str( ) ) != 0 ) {
+				local.push_back( std::wstring( cwd ) + L"\\" + k_dll_name );
+			}
+
+			wchar_t temp[ MAX_PATH ]{};
+			if ( GetTempPathW( MAX_PATH, temp ) ) {
+				local.push_back( std::wstring( temp ) + k_dll_name );
+			}
+		}
 
 		for ( const auto& candidate : local )
 		{
-			if ( file_exists( candidate ) ) {
+			if ( !file_exists( candidate ) ) {
+				continue;
+			}
+
+			if ( check_candidate( candidate, publish ) ) {
 				write_cache( candidate );
 				return candidate;
 			}
 		}
 
-		return directory + L"\\" + k_dll_name;
+		// Ни один ближний не прошёл -- фиксируем причину по «главному» пути,
+		// чтобы UI показал не «не найдена», а конкретный диагноз.
+		if ( publish && file_exists( local[ 0 ] ) ) {
+			check_candidate( local[ 0 ], true );
+		}
+
+		return {};
 	}
 
 	std::wstring deep_search_dll( std::atomic<int>& visited )
 	{
 		std::wstring best{};
-		std::wstring best_fallback{};
-		std::mutex best_mtx{};
+		verification::result best_check{};
+
+		// Собираем все кандидаты и проверяем ИХ В КОНЦЕ, а не на ходу.
+		// Причина: проверка читает файл целиком (десятки МБ) и считает SHA-256,
+		// и делать это для каждого встреченного DarkFox*.dll на диске --
+		// неприемлемо. Сначала дешёвый фильтр по имени, потом дорогая проверка
+		// только для лучших.
+		std::vector< std::wstring > exact;
+		std::vector< std::wstring > family;
+		std::mutex collect_mtx{};
 
 		for ( const auto& root : local_drive_roots( ) )
 		{
@@ -548,25 +648,19 @@ namespace {
 						return;
 					}
 
+					// Бэкапы (.bak_*) отсеиваем сразу: это копии прошлых
+					// сборок, инжектить их нельзя даже если файл цел.
 					if ( name.find( L".bak" ) != std::wstring::npos ) {
 						return;
 					}
 
-					std::scoped_lock lock( best_mtx );
+					std::scoped_lock lock( collect_mtx );
 
-					if ( is_exact_match( path ) )
-					{
-						if ( best.empty( ) || is_newer( path, best ) ) {
-							best = path;
-						}
-						return;
+					if ( is_exact_match( path ) ) {
+						exact.push_back( path );
 					}
-
-					if ( is_same_family( path ) )
-					{
-						if ( best_fallback.empty( ) || is_newer( path, best_fallback ) ) {
-							best_fallback = path;
-						}
+					else if ( is_same_family( path ) ) {
+						family.push_back( path );
 					}
 				}, g_abort, visited );
 
@@ -575,8 +669,65 @@ namespace {
 			}
 		}
 
-		std::scoped_lock lock( best_mtx );
-		return best.empty( ) ? best_fallback : best;
+		// Точное имя в приоритете. Внутри группы -- самые новые вперёд:
+		// свежая сборка обычно и есть нужная.
+		const auto by_newest = [ ]( std::vector< std::wstring >& list )
+			{
+				std::sort( list.begin( ), list.end( ),
+					[ ]( const std::wstring& lhs, const std::wstring& rhs )
+					{
+						return is_newer( lhs, rhs );
+					} );
+			};
+
+		by_newest( exact );
+		by_newest( family );
+
+		for ( const auto& candidate : exact )
+		{
+			if ( g_abort ) {
+				break;
+			}
+
+			verification::result check{};
+			if ( check_candidate_silent( candidate, check ) )
+			{
+				best = candidate;
+				best_check = check;
+				break;
+			}
+
+			// Запоминаем первую же диагностику, чтобы объяснить пользователю,
+			// ПОЧЕМУ файл с правильным именем не подошёл.
+			if ( best_check.state == verification::status::not_found ) {
+				best_check = check;
+			}
+		}
+
+		if ( best.empty( ) )
+		{
+			for ( const auto& candidate : family )
+			{
+				if ( g_abort ) {
+					break;
+				}
+
+				verification::result check{};
+				if ( check_candidate_silent( candidate, check ) )
+				{
+					best = candidate;
+					best_check = check;
+					break;
+				}
+			}
+		}
+
+		{
+			std::scoped_lock lock( g_check_mtx );
+			g_dll_check = best_check;
+		}
+
+		return best;
 	}
 
 	// -----------------------------------------------------------------------
@@ -955,6 +1106,25 @@ namespace {
 		return value == stage::launching || value == stage::waiting_game || value == stage::injecting;
 	}
 
+	// Человекочитаемое объяснение, почему файл не годится. Раньше на любой
+	// отказ было одно «не нашёл» -- и по нему нельзя было понять, файла нет
+	// или он лежит, но помечен чужой сборкой.
+	std::wstring describe_failure( )
+	{
+		verification::result snapshot{};
+		{
+			std::scoped_lock lock( g_check_mtx );
+			snapshot = g_dll_check;
+		}
+
+		if ( snapshot.state == verification::status::not_found ) {
+			return L"не нашёл " + std::wstring( k_dll_name ) + L" ни на одном диске";
+		}
+
+		return std::wstring( k_dll_name ) + L": "
+			+ to_wide( verification::status_text( snapshot.state ) );
+	}
+
 	bool ensure_dll_located( std::wstring& out_error )
 	{
 		const auto quick = resolve_dll_path( );
@@ -977,13 +1147,15 @@ namespace {
 		if ( result.empty( ) )
 		{
 			g_dll_present = false;
-			out_error = L"не нашёл " + std::wstring( k_dll_name ) + L" ни на одном диске";
+			out_error = describe_failure( );
 			return false;
 		}
 
 		g_dll_path = result;
 		g_dll_present = true;
 		g_dll_from_scan = true;
+
+		// Запоминаем, чтобы следующий запуск стартовал мгновенно.
 		write_cache( result );
 		return true;
 	}
@@ -1419,15 +1591,71 @@ namespace {
 				dll_detail = "поиск... " + std::to_string( g_scan_visited.load( ) );
 				dll_color = accent;
 			}
-			else if ( g_dll_present ) {
-				dll_detail = g_dll_from_scan ? "найдена обходом" : "найдена";
-				dll_color = xdraw::color{ 122, 224, 160, 255 };
+			else if ( g_dll_present )
+			{
+				verification::result check{};
+				{
+					std::scoped_lock lock( g_check_mtx );
+					check = g_dll_check;
+				}
+
+				// Хеш не сошёлся -- это не отказ, но пользователь обязан
+				// увидеть, что файл не совпадает с записанным эталоном.
+				if ( check.hash == verification::result::hash_state::mismatch ) {
+					dll_detail = "хеш не сошёлся";
+					dll_color = xdraw::color{ 255, 120, 120, 255 };
+				}
+				else if ( check.hash == verification::result::hash_state::match ) {
+					dll_detail = "подлинность ok";
+					dll_color = xdraw::color{ 122, 224, 160, 255 };
+				}
+				else {
+					dll_detail = g_dll_from_scan ? "найдена обходом" : "найдена";
+					dll_color = xdraw::color{ 122, 224, 160, 255 };
+				}
 			}
 			else {
-				dll_detail = "не найдена";
+				verification::result check{};
+				{
+					std::scoped_lock lock( g_check_mtx );
+					check = g_dll_check;
+				}
+
+				dll_detail = check.state == verification::status::not_found
+					? "не найдена"
+					: to_utf8( to_wide( verification::status_text( check.state ) ) );
+				dll_color = xdraw::color{ 255, 120, 120, 255 };
 			}
 
 			draw_card( to_utf8( k_dll_name ).c_str( ), dll_detail, dll_color, card_w );
+
+			// Вторая строка под карточкой DLL: полный путь и разбор маркера.
+			// Когда файл найден по обходу дисков, путь критичен -- непонятно,
+			// какой именно из копий лоадер выбрал.
+			if ( g_dll_present && !g_dll_path.empty( ) )
+			{
+				verification::result check{};
+				{
+					std::scoped_lock lock( g_check_mtx );
+					check = g_dll_check;
+				}
+
+				auto info = to_utf8( g_dll_path );
+
+				if ( check.has_marker )
+				{
+					info += "  [" + to_utf8( to_wide( check.build ) )
+						+ ", build " + std::to_string( check.build_id ) + "]";
+
+					if ( check.size ) {
+						info += "  " + std::to_string( check.size / ( 1024 * 1024 ) ) + " МБ";
+					}
+				}
+
+				const auto pos = xui::layout::item( card_w, 18.0f );
+				dl.text( pos.x + 4.0f, pos.y, info.c_str( ),
+					xdraw::color{ 140, 144, 156, 255 }, g_font_small );
+			}
 
 			draw_card( "права администратора",
 				g_is_admin ? "полные" : "нет -- UAC",
@@ -1521,8 +1749,12 @@ namespace {
 			g_shortcut_ok = create_shortcut( error );
 			g_shortcut_note = g_shortcut_ok ? L"" : error;
 
+			// resolve_dll_path возвращает путь ТОЛЬКО для проверенного файла
+			// (PE x64 DLL + маркер). Пустая строка = годного файла нет, и
+			// отдельный file_exists тут не нужен: он бы отметил «найдена»
+			// для файла, который на самом деле отвергнут проверкой.
 			g_dll_path = resolve_dll_path( );
-			g_dll_present = file_exists( g_dll_path );
+			g_dll_present = !g_dll_path.empty( );
 			g_dll_from_scan = false;
 
 			refresh_status( );

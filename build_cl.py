@@ -636,6 +636,27 @@ def main():
 
     size = os.path.getsize(dll)
     print(f"\nOK: {dll} ({size:,} bytes)")
+
+    # Хеш-файл для лоадера. Лежит рядом с DLL и позволяет проверить, что
+    # инжектится именно эта сборка. Считаем ДО того, как DLL будет запущена
+    # игрой (иначе файл занят и GetFileSize/чтение упрутся в шаринг), и не
+    # роняем сборку, если записать не удалось: хеш -- необязательное
+    # украшение, а не часть бинаря.
+    try:
+        import hashlib
+        digest = hashlib.sha256()
+        with open(dll, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+
+        hash_path = dll + ".hash"
+        with open(hash_path, "w", encoding="ascii", newline="\n") as handle:
+            handle.write(digest.hexdigest() + "  " + os.path.basename(dll) + "\n")
+
+        print(f"[hash] {os.path.basename(hash_path)} = {digest.hexdigest()}")
+    except OSError as exc:
+        print(f"[hash] не удалось записать хеш-файл: {exc}")
+
     return 0
 
 

@@ -47,10 +47,26 @@ rem BuildTools лежит на D:, SDK -- на C:. Оба пути переоп�
 if not defined DARKFOX_VS_DIR  set "DARKFOX_VS_DIR=D:\BuildTools"
 if not defined DARKFOX_SDK_DIR set "DARKFOX_SDK_DIR=C:\Program Files (x86)\Windows Kits\10"
 
-set "MSVCVER=14.51.36231"
 set "SDKVER=10.0.26100.0"
-set "VCTOOLS=%DARKFOX_VS_DIR%\VC\Tools\MSVC\%MSVCVER%"
 set "SDK=%DARKFOX_SDK_DIR%"
+
+rem Версию MSVC НЕ хардкодим. Раньше тут стояло "14.51.36231", и после
+rem переустановки тулчейна (14.44.35207) сборка молча падала с «cl.exe not
+rem found», хотя cl на месте. Ищем самый старший каталог сам: так bat
+rem переживает смену версии MSVC и не расходится с build_cl.py, который
+rem делает ровно то же.
+set "MSVCVER="
+for /f "delims=" %%v in ('dir /b /ad /o-n "%DARKFOX_VS_DIR%\VC\Tools\MSVC" 2^>nul') do (
+    if not defined MSVCVER set "MSVCVER=%%v"
+)
+
+if not defined MSVCVER (
+    echo [!] не нашёл ни одной версии MSVC в "%DARKFOX_VS_DIR%\VC\Tools\MSVC"
+    echo     Укажи каталог BuildTools в DARKFOX_VS_DIR.
+    goto :failed
+)
+
+set "VCTOOLS=%DARKFOX_VS_DIR%\VC\Tools\MSVC\%MSVCVER%"
 
 if not exist "%VCTOOLS%\bin\Hostx64\x64\cl.exe" (
     echo [!] cl.exe not found: "%VCTOOLS%\bin\Hostx64\x64\cl.exe"
